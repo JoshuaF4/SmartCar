@@ -1,0 +1,120 @@
+# Smart Car Configuration
+
+# Hardware GPIO Pins
+hardware:
+  motors:
+    # L298N Motor Driver Pins
+    left_forward: 17
+    left_backward: 27
+    right_forward: 22
+    right_backward: 23
+    left_pwm: 12
+    right_pwm: 13
+    pwm_frequency: 1000
+
+  servos:
+    # PCA9685 Servo Controller
+    i2c_address: 0x40
+    camera_pan: 0      # Channel for pan servo
+    camera_tilt: 1     # Channel for tilt servo
+    pan_min: 0
+    pan_max: 180
+    tilt_min: 0
+    tilt_max: 90
+    default_pan: 90
+    default_tilt: 45
+
+  sensors:
+    # Ultrasonic sensors (HC-SR04)
+    front:
+      trigger: 5
+      echo: 6
+    left:
+      trigger: 19
+      echo: 26
+    right:
+      trigger: 20
+      echo: 21
+
+    # IR sensors for line following
+    ir_left: 24
+    ir_right: 25
+
+# Camera settings
+camera:
+  resolution:
+    width: 640
+    height: 480
+  framerate: 30
+  format: "RGB888"
+  rotation: 0
+
+# NeoYolo Detection settings
+detection:
+  model_path: "models/neoyolo.pt"
+  confidence_threshold: 0.5
+  nms_threshold: 0.4
+  input_size: 416
+  classes:
+    - person
+    - car
+    - bicycle
+    - motorcycle
+    - bus
+    - truck
+    - traffic_light
+    - stop_sign
+    - obstacle
+
+  # Detection zones (relative to image)
+  danger_zone:
+    y_start: 0.6  # Bottom 40% of image
+    y_end: 1.0
+  warning_zone:
+    y_start: 0.3
+    y_end: 0.6
+
+# Pathfinding settings
+navigation:
+  grid_resolution: 0.1  # meters per cell
+  robot_radius: 0.15    # meters
+  safety_margin: 0.1    # additional margin in meters
+  max_speed: 0.5        # m/s
+  turn_speed: 0.3       # m/s during turns
+
+  # A* parameters
+  pathfinding:
+    heuristic_weight: 1.0
+    diagonal_movement: true
+    smoothing: true
+
+# Network settings
+network:
+  local:
+    host: "0.0.0.0"
+    websocket_port: 8765
+    http_port: 5000
+
+  computer:
+    # Extended capabilities server
+    host: "192.168.1.100"
+    port: 9000
+    reconnect_interval: 5
+
+  streaming:
+    enabled: true
+    quality: 80
+    fps: 15
+
+# Control modes
+modes:
+  autonomous: true
+  manual_override: true
+  computer_assist: true
+
+# Safety settings
+safety:
+  min_obstacle_distance: 0.3  # meters
+  emergency_stop_distance: 0.15
+  max_runtime: 3600  # seconds
+  low_battery_threshold: 10.5  # volts
