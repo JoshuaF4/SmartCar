@@ -106,9 +106,13 @@ class ComputerClient:
                         'camera',
                         'motors',
                         'sensors',
-                        'detection'
+                        'detection',
+                        'path_memory'
                     ]
                 })
+
+                # Send initial path memory sync
+                await self._sync_path_memory()
 
                 # Main message loop
                 while not self._stop_event.is_set():
@@ -175,6 +179,21 @@ class ComputerClient:
                     self.use_remote_detection = False
                 elif feature == 'planning':
                     self.use_remote_planning = False
+
+            elif msg_type == 'request_path_memory':
+                # Computer requesting path memory sync
+                await self._sync_path_memory()
+
+            elif msg_type == 'path_memory_update':
+                # Receive processed/optimized path data from computer
+                self._import_path_data(data.get('data', {}))
+
+            elif msg_type == 'optimized_route':
+                # Computer sends optimized route based on historical data
+                route = data.get('data', {})
+                if route.get('waypoints'):
+                    self.car.current_path = route['waypoints']
+                    logger.info(f"Received optimized route with {len(route['waypoints'])} waypoints")
 
             if self.on_command:
                 self.on_command(data)
@@ -257,12 +276,43 @@ class ComputerClient:
             config.set(key, value)
         logger.info("Configuration updated from computer")
 
+    def _import_path_data(self, data: dict):
+        """Import processed path data from computer"""
+        if hasattr(self.car, 'import_path_data'):
+            self.car.import_path_data(data)
+            logger.info("Imported path memory update from computer")
+
+    async def _sync_path_memory(self):
+        """Send path memory to computer for processing/storage"""
+        try:
+            path_export = self.car.get_path_memory_export()
+            await self._send({
+                'type': 'path_memory_sync',
+                'data': path_export
+            })
+            logger.info(f"Synced path memory: {path_export.get('total_paths', 0)} paths")
+        except Exception as e:
+            logger.error(f"Failed to sync path memory: {e}")
+
     def send_status(self):
         """Send current status to computer"""
         if self.is_connected:
             asyncio.run(self._send({
                 'type': 'status',
                 'data': self.car.get_status()
+            }))
+
+    def sync_path_memory(self):
+        """Manually trigger path memory sync to computer"""
+        if self.is_connected:
+            asyncio.run(self._sync_path_memory())
+
+    def send_recorded_path(self, path_data: dict):
+        """Send a newly recorded path to computer"""
+        if self.is_connected:
+            asyncio.run(self._send({
+                'type': 'new_path',
+                'data': path_data
             }))
 
     def send_detection(self, detection_result: dict):

@@ -7,7 +7,10 @@ import json
 import logging
 import asyncio
 import base64
-from typing import Set, Dict, Optional
+import time
+import math
+from pathlib import Path
+from typing import Set, Dict, Optional, List
 
 import cv2
 import numpy as np
@@ -51,6 +54,15 @@ class ComputerServer:
         # Path planner (could use more advanced algorithms)
         self.use_advanced_planning = True
 
+        # Path memory storage
+        self.path_storage_dir = Path("data/car_paths")
+        self.path_storage_dir.mkdir(parents=True, exist_ok=True)
+
+        # Aggregated path data from all cars
+        self.all_paths: Dict[str, dict] = {}
+        self.obstacle_heatmap: Dict[tuple, int] = {}
+        self.optimized_routes: Dict[str, List] = {}
+
     def initialize(self):
         """Initialize server components"""
         # Load YOLO model
@@ -61,6 +73,10 @@ class ComputerServer:
             dummy = np.zeros((640, 640, 3), dtype=np.uint8)
             self.model(dummy, verbose=False)
             logger.info("Detection model loaded")
+
+        # Load existing path data
+        self._load_path_storage()
+        logger.info(f"Loaded {len(self.all_paths)} stored paths")
 
     async def handle_connection(self, websocket, path):
         """Handle car connection"""
@@ -125,6 +141,28 @@ class ComputerServer:
             elif msg_type == 'detection':
                 # Log detection from car
                 self._log_detection(data.get('data', {}))
+
+            elif msg_type == 'path_memory_sync':
+                # Receive and store path memory from car
+                car_id = self.cars[websocket]['id']
+                await self._handle_path_memory_sync(websocket, car_id, data.get('data', {}))
+
+            elif msg_type == 'new_path':
+                # Receive a newly recorded path
+                car_id = self.cars[websocket]['id']
+                self._store_path(car_id, data.get('data', {}))
+
+            elif msg_type == 'request_optimized_route':
+                # Car requesting optimized route based on historical data
+                route_request = data.get('data', {})
+                route = self._get_optimized_route(
+                    route_request.get('start'),
+                    route_request.get('goal')
+                )
+                await self._send(websocket, {
+                    'type': 'optimized_route',
+                    'data': {'waypoints': route}
+                })
 
         except json.JSONDecodeError:
             logger.error("Invalid JSON from car")
@@ -217,6 +255,218 @@ class ComputerServer:
         """Log detection data"""
         # In production, save to database for analysis
         logger.debug(f"Detection logged: {detection}")
+
+    # Path memory management methods
+    def _load_path_storage(self):
+        """Load all stored path data"""
+        try:
+            for car_dir in self.path_storage_dir.iterdir():
+                if car_dir.is_dir():
+                    for path_file in car_dir.glob("*.json"):
+                        with open(path_file, 'r') as f:
+                            path_data = json.load(f)
+                            path_id = path_data.get('path_id', path_file.stem)
+                            self.all_paths[path_id] = path_data
+
+                            # Update obstacle heatmap
+                            self._update_heatmap_from_path(path_data)
+
+        except Exception as e:
+            logger.error(f"Error loading path storage: {e}")
+
+    def _update_heatmap_from_path(self, path_data: dict):
+        """Update obstacle heatmap from path data"""
+        for point in path_data.get('points', []):
+            if point.get('obstacle_detected'):
+                # Round to grid cell (0.1m resolution)
+                cell = (
+                    round(point['x'] * 10) / 10,
+                    round(point['y'] * 10) / 10
+                )
+                self.obstacle_heatmap[cell] = self.obstacle_heatmap.get(cell, 0) + 1
+
+    async def _handle_path_memory_sync(self, websocket, car_id: int, data: dict):
+        """Handle path memory sync from car"""
+        logger.info(f"Received path memory sync from car {car_id}: {data.get('total_paths', 0)} paths")
+
+        # Store paths from car
+        car_storage = self.path_storage_dir / str(car_id)
+        car_storage.mkdir(exist_ok=True)
+
+        for path_data in data.get('paths', []):
+            path_id = path_data.get('path_id', f"path_{time.time()}")
+            self.all_paths[path_id] = path_data
+            self._update_heatmap_from_path(path_data)
+
+            # Save to disk
+            path_file = car_storage / f"{path_id}.json"
+            with open(path_file, 'w') as f:
+                json.dump(path_data, f)
+
+        # Analyze and send back optimized data
+        optimized_data = self._analyze_paths(car_id)
+
+        await self._send(websocket, {
+            'type': 'path_memory_update',
+            'data': optimized_data
+        })
+
+        logger.info(f"Sent optimized path data to car {car_id}")
+
+    def _store_path(self, car_id: int, path_data: dict):
+        """Store a single path from car"""
+        path_id = path_data.get('path_id', f"path_{time.time()}")
+        self.all_paths[path_id] = path_data
+        self._update_heatmap_from_path(path_data)
+
+        # Save to disk
+        car_storage = self.path_storage_dir / str(car_id)
+        car_storage.mkdir(exist_ok=True)
+
+        path_file = car_storage / f"{path_id}.json"
+        with open(path_file, 'w') as f:
+            json.dump(path_data, f)
+
+        logger.info(f"Stored path {path_id} from car {car_id}")
+
+    def _analyze_paths(self, car_id: int) -> dict:
+        """Analyze paths and generate optimized data for car"""
+        result = {
+            'avoidance_zones': [],
+            'optimized_paths': [],
+            'hotspots': []
+        }
+
+        # Generate avoidance zones from heatmap
+        for cell, count in self.obstacle_heatmap.items():
+            if count >= 2:  # Threshold for avoidance
+                radius = min(0.5, 0.1 + count * 0.05)
+                result['avoidance_zones'].append([cell[0], cell[1], radius])
+                result['hotspots'].append({
+                    'x': cell[0],
+                    'y': cell[1],
+                    'count': count
+                })
+
+        # Find and optimize successful routes
+        successful_paths = [
+            p for p in self.all_paths.values()
+            if p.get('success', False)
+        ]
+
+        # Group by similar start/end points and optimize
+        route_groups = self._group_similar_routes(successful_paths)
+        for group_key, paths in route_groups.items():
+            if len(paths) >= 2:
+                optimized = self._optimize_route_group(paths)
+                if optimized:
+                    result['optimized_paths'].append(optimized)
+
+        return result
+
+    def _group_similar_routes(self, paths: list) -> dict:
+        """Group paths by similar start/end points"""
+        groups = {}
+
+        for path in paths:
+            points = path.get('points', [])
+            if len(points) < 2:
+                continue
+
+            start = (round(points[0]['x'], 1), round(points[0]['y'], 1))
+            end = (round(points[-1]['x'], 1), round(points[-1]['y'], 1))
+            key = (start, end)
+
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(path)
+
+        return groups
+
+    def _optimize_route_group(self, paths: list) -> dict:
+        """Create optimized route from group of similar paths"""
+        if not paths:
+            return None
+
+        # Use shortest successful path as base
+        paths.sort(key=lambda p: p.get('total_distance', float('inf')))
+        best = paths[0]
+
+        # Simplify waypoints
+        points = best.get('points', [])
+        simplified = []
+
+        for i, point in enumerate(points):
+            # Keep first, last, and every Nth point
+            if i == 0 or i == len(points) - 1 or i % 10 == 0:
+                simplified.append([point['x'], point['y']])
+
+        return {
+            'path_id': f"optimized_{best.get('path_id', 'unknown')}",
+            'points': simplified,
+            'total_distance': best.get('total_distance', 0),
+            'source': 'computer_optimized',
+            'based_on_paths': len(paths)
+        }
+
+    def _get_optimized_route(self, start: tuple, goal: tuple) -> list:
+        """Get optimized route based on historical data"""
+        if not start or not goal:
+            return []
+
+        # Find matching routes
+        tolerance = 0.5
+        matching = []
+
+        for path_id, path_data in self.all_paths.items():
+            points = path_data.get('points', [])
+            if len(points) < 2:
+                continue
+
+            path_start = (points[0]['x'], points[0]['y'])
+            path_end = (points[-1]['x'], points[-1]['y'])
+
+            start_dist = math.sqrt(
+                (path_start[0] - start[0])**2 +
+                (path_start[1] - start[1])**2
+            )
+            end_dist = math.sqrt(
+                (path_end[0] - goal[0])**2 +
+                (path_end[1] - goal[1])**2
+            )
+
+            if start_dist <= tolerance and end_dist <= tolerance:
+                if path_data.get('success', False):
+                    matching.append(path_data)
+
+        if not matching:
+            # Fall back to computed path
+            return self._compute_path(start, goal, [])
+
+        # Use best match
+        matching.sort(key=lambda p: p.get('total_distance', float('inf')))
+        best = matching[0]
+
+        # Extract waypoints
+        waypoints = []
+        for point in best.get('points', []):
+            waypoints.append([point['x'], point['y']])
+
+        return waypoints
+
+    def get_path_statistics(self) -> dict:
+        """Get statistics about stored paths"""
+        total = len(self.all_paths)
+        successful = sum(1 for p in self.all_paths.values() if p.get('success', False))
+        total_distance = sum(p.get('total_distance', 0) for p in self.all_paths.values())
+
+        return {
+            'total_paths': total,
+            'successful_paths': successful,
+            'failed_paths': total - successful,
+            'total_distance': total_distance,
+            'obstacle_hotspots': len([c for c, cnt in self.obstacle_heatmap.items() if cnt >= 2])
+        }
 
     async def broadcast_command(self, command: dict):
         """Send command to all connected cars"""

@@ -12,7 +12,7 @@ from enum import Enum
 from .hardware import MotorController, ServoController, SensorManager
 from .camera import CameraCapture, CameraArm
 from .detection import NeoYoloDetector
-from .navigation import AStarPathfinder, ObstacleAvoider
+from .navigation import AStarPathfinder, ObstacleAvoider, PathMemory
 from .config import config
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ class SmartCarController:
         self.detector = NeoYoloDetector()
         self.pathfinder = AStarPathfinder()
         self.avoider = ObstacleAvoider(self.sensors)
+        self.path_memory = PathMemory()
 
         # State
         self.mode = CarMode.IDLE
@@ -63,9 +64,18 @@ class SmartCarController:
         self.last_detection_result = None
         self.current_path = None
 
+        # Position tracking (simplified - would use odometry in real implementation)
+        self.current_position = (0.0, 0.0)
+        self.current_heading = 0.0
+        self._position_update_interval = 0
+
+        # Path recording
+        self.record_interval = 5  # Record every N control loops
+
         # Callbacks for network communication
         self.on_status_update = None
         self.on_detection = None
+        self.on_path_recorded = None
 
         self.is_initialized = False
 
@@ -91,7 +101,7 @@ class SmartCarController:
             self.cleanup()
             raise
 
-    def start(self, mode: CarMode = CarMode.AUTONOMOUS):
+    def start(self, mode: CarMode = CarMode.AUTONOMOUS, record_path: bool = True):
         """Start the car in specified mode"""
         if not self.is_initialized:
             self.initialize()
@@ -103,6 +113,10 @@ class SmartCarController:
         # Start camera
         self.camera.start()
 
+        # Start path recording
+        if record_path and mode in [CarMode.AUTONOMOUS, CarMode.PATHFINDING]:
+            self.path_memory.start_recording({'mode': mode.value})
+
         # Start control loop
         self._control_thread = Thread(target=self._control_loop)
         self._control_thread.daemon = True
@@ -110,13 +124,19 @@ class SmartCarController:
 
         logger.info(f"Smart Car started in {mode.value} mode")
 
-    def stop(self):
+    def stop(self, path_success: bool = True):
         """Stop the car"""
         self.is_running = False
         self._stop_event.set()
 
         # Stop motors immediately
         self.motors.stop()
+
+        # Stop path recording and save
+        if self.path_memory.is_recording:
+            recorded_path = self.path_memory.stop_recording(success=path_success)
+            if recorded_path and self.on_path_recorded:
+                self.on_path_recorded(recorded_path)
 
         # Wait for control thread
         if self._control_thread:
@@ -181,6 +201,54 @@ class SmartCarController:
         self.current_speed = (command['left_speed'] + command['right_speed']) / 2
         self.current_direction = command['action']
 
+        # Update position estimate and record path
+        self._update_position(command)
+        self._record_path_point(detection_result)
+
+    def _update_position(self, command: Dict):
+        """Update estimated position based on motor commands"""
+        # Simplified dead reckoning - real implementation would use encoders/IMU
+        dt = 1.0 / self.control_rate
+        speed = self.current_speed / 100.0  # Normalize
+
+        # Estimate movement
+        import math
+        dx = speed * math.cos(math.radians(self.current_heading)) * dt * 0.1
+        dy = speed * math.sin(math.radians(self.current_heading)) * dt * 0.1
+
+        self.current_position = (
+            self.current_position[0] + dx,
+            self.current_position[1] + dy
+        )
+
+        # Update heading based on turning
+        if command['action'] in ['avoid_left', 'turn_left']:
+            self.current_heading += 5
+        elif command['action'] in ['avoid_right', 'turn_right']:
+            self.current_heading -= 5
+
+        self.current_heading = self.current_heading % 360
+
+    def _record_path_point(self, detection_result: Dict):
+        """Record current position to path memory"""
+        if not self.path_memory.is_recording:
+            return
+
+        self._position_update_interval += 1
+        if self._position_update_interval < self.record_interval:
+            return
+
+        self._position_update_interval = 0
+
+        self.path_memory.record_point(
+            x=self.current_position[0],
+            y=self.current_position[1],
+            heading=self.current_heading,
+            speed=self.current_speed,
+            obstacle_detected=detection_result.get('has_danger', False),
+            sensor_data=self.sensors.distances.copy()
+        )
+
     def _pathfinding_control(self):
         """Follow calculated path while avoiding obstacles"""
         if not self.current_path or len(self.current_path) == 0:
@@ -229,10 +297,14 @@ class SmartCarController:
             'is_running': self.is_running,
             'speed': self.current_speed,
             'direction': self.current_direction,
+            'position': self.current_position,
+            'heading': self.current_heading,
             'sensor_distances': self.sensors.distances.copy(),
             'has_obstacle': self.avoider.state.value,
             'camera_position': self.servos.get_position(),
-            'detection_fps': self.detector.get_fps()
+            'detection_fps': self.detector.get_fps(),
+            'path_memory_stats': self.path_memory.get_statistics(),
+            'is_recording_path': self.path_memory.is_recording
         }
 
     # Manual control methods
@@ -274,16 +346,30 @@ class SmartCarController:
         return self.camera_arm.perform_scan('horizontal')
 
     # Navigation methods
-    def set_goal(self, x: float, y: float):
+    def set_goal(self, x: float, y: float, use_memory: bool = True):
         """Set navigation goal in world coordinates"""
-        # Assume we're at origin (would need localization in real use)
-        start = (0.0, 0.0)
+        start = self.current_position
         goal = (x, y)
 
-        path = self.pathfinder.find_path_world(start, goal)
+        path = None
+
+        # Try to use historical path first
+        if use_memory:
+            path = self.path_memory.get_preferred_route(start, goal)
+            if path:
+                logger.info(f"Using historical path with {len(path)} waypoints")
+
+        # Fall back to A* pathfinding
+        if not path:
+            # Add known obstacle hotspots to grid
+            avoidance_zones = self.path_memory.get_avoidance_zones()
+            for zone_x, zone_y, radius in avoidance_zones:
+                self.pathfinder.grid_map.add_obstacle_world(zone_x, zone_y, radius)
+
+            path = self.pathfinder.find_path_world(start, goal)
 
         if path:
-            self.current_path = path
+            self.current_path = list(path)
             self.mode = CarMode.PATHFINDING
             logger.info(f"Path found with {len(path)} waypoints")
         else:
@@ -292,6 +378,29 @@ class SmartCarController:
     def add_obstacle(self, x: float, y: float, radius: float = 0.2):
         """Add obstacle to pathfinding grid"""
         self.pathfinder.grid_map.add_obstacle_world(x, y, radius)
+
+    # Path memory methods
+    def get_path_memory_export(self) -> Dict:
+        """Export path memory for transmission to computer"""
+        return self.path_memory.export_for_transmission()
+
+    def import_path_data(self, data: Dict):
+        """Import path data from computer"""
+        self.path_memory.import_from_computer(data)
+
+    def get_obstacle_hotspots(self):
+        """Get known obstacle hotspots from path memory"""
+        return self.path_memory.get_obstacle_hotspots()
+
+    def get_historical_paths(self, start: Tuple[float, float],
+                            goal: Tuple[float, float]):
+        """Get successful historical paths between points"""
+        return self.path_memory.get_successful_paths(start, goal)
+
+    def reset_position(self, x: float = 0.0, y: float = 0.0, heading: float = 0.0):
+        """Reset position tracking"""
+        self.current_position = (x, y)
+        self.current_heading = heading
 
     # Utility methods
     def get_frame(self):

@@ -8,8 +8,10 @@ A comprehensive autonomous car system for Raspberry Pi with camera arm, NeoYolo-
 - **Camera Arm Control**: Pan/tilt servo-controlled camera for environment scanning
 - **A* Pathfinding**: Grid-based pathfinding with obstacle avoidance
 - **Reactive Obstacle Avoidance**: Sensor fusion from ultrasonic sensors and camera
+- **Path Memory & Learning**: Records routes, learns from previous paths, identifies obstacle hotspots
 - **Network Control**: WebSocket and HTTP server for remote control
 - **Computer Connectivity**: Extended processing capabilities when connected to a computer with GPU
+- **Path Transmission**: Syncs path memory to computer for analysis, optimization, and storage
 
 ## Hardware Requirements
 
@@ -154,7 +156,8 @@ SmartCar/
 │   │   └── neoyolo.py        # YOLO obstacle detection
 │   ├── navigation/
 │   │   ├── pathfinding.py    # A* pathfinding
-│   │   └── obstacle_avoidance.py  # Reactive avoidance
+│   │   ├── obstacle_avoidance.py  # Reactive avoidance
+│   │   └── path_memory.py    # Route learning & memory
 │   ├── network/
 │   │   ├── server.py         # Control server (on Pi)
 │   │   └── client.py         # Computer connection
@@ -163,9 +166,63 @@ SmartCar/
 │   └── main.py               # Entry point
 ├── computer/
 │   └── server.py             # Computer-side server
+├── data/
+│   └── paths/                # Stored path memory
 ├── models/                   # YOLO models
 └── requirements.txt
 ```
+
+## Path Memory & Learning
+
+The SmartCar learns from previous routes to improve navigation over time:
+
+### How It Works
+
+1. **Recording**: During autonomous operation, the car records:
+   - Position coordinates (x, y)
+   - Heading and speed
+   - Obstacle detections
+   - Sensor readings at each point
+
+2. **Local Storage**: Paths are stored locally on the Pi in `data/paths/`
+
+3. **Computer Sync**: When connected to a computer:
+   - Path memory is transmitted for analysis
+   - Computer aggregates data from multiple cars
+   - Optimized routes are computed and sent back
+   - Obstacle heatmaps identify dangerous areas
+
+### Features
+
+- **Historical Routes**: Uses successful past routes for navigation
+- **Obstacle Hotspots**: Identifies frequently encountered obstacle locations
+- **Avoidance Zones**: Automatically avoids areas with high failure rates
+- **Route Optimization**: Computer analyzes and simplifies routes
+- **Multi-Car Learning**: Computer aggregates learning from multiple cars
+
+### Usage
+
+```python
+# The car automatically records paths during autonomous mode
+car.start(mode=CarMode.AUTONOMOUS, record_path=True)
+
+# Navigate using historical paths
+car.set_goal(x=2.0, y=3.0, use_memory=True)
+
+# Export path memory for analysis
+path_data = car.get_path_memory_export()
+
+# Get obstacle hotspots
+hotspots = car.get_obstacle_hotspots()
+```
+
+### Computer-Side Storage
+
+The computer server stores paths from all connected cars and provides:
+- Centralized path database
+- Cross-car learning
+- Advanced route optimization
+- Obstacle heatmap generation
 
 ## Extended Capabilities (Computer Connection)
 
