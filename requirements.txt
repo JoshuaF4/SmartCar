@@ -36,3 +36,8 @@ asyncio-mqtt>=0.16.0
 # Optional: For extended computer capabilities
 paramiko>=3.3.0  # SSH tunneling
 pyzmq>=25.0.0    # High-performance messaging
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
