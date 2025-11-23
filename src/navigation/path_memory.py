@@ -27,6 +27,8 @@ class PathPoint:
     speed: float = 0.0
     obstacle_detected: bool = False
     sensor_data: Dict = field(default_factory=dict)
+    obstacle_confidence: float = 1.0  # Confidence in obstacle detection
+    obstacle_velocity: Tuple[float, float] = (0.0, 0.0)  # Observed obstacle velocity
 
 
 @dataclass
@@ -98,6 +100,11 @@ class PathMemory:
         self.total_paths = 0
         self.total_distance = 0.0
 
+        # Dynamic obstacle tracking
+        self.obstacle_decay_rate = config.navigation.get('obstacle_decay_rate', 0.1)
+        self.obstacle_half_life = config.navigation.get('obstacle_half_life', 300.0)  # 5 minutes
+        self.dynamic_obstacle_data: Dict[Tuple[int, int], List[Dict]] = {}
+
         # Load existing paths
         self._load_paths()
 
@@ -152,7 +159,8 @@ class PathMemory:
 
     def record_point(self, x: float, y: float, heading: float = 0.0,
                      speed: float = 0.0, obstacle_detected: bool = False,
-                     sensor_data: Dict = None):
+                     sensor_data: Dict = None, obstacle_confidence: float = 1.0,
+                     obstacle_velocity: Tuple[float, float] = (0.0, 0.0)):
         """Record a point in the current path"""
         if not self.is_recording:
             return
@@ -164,13 +172,32 @@ class PathMemory:
             heading=heading,
             speed=speed,
             obstacle_detected=obstacle_detected,
-            sensor_data=sensor_data or {}
+            sensor_data=sensor_data or {},
+            obstacle_confidence=obstacle_confidence,
+            obstacle_velocity=obstacle_velocity
         )
 
         self.current_points.append(point)
 
         if obstacle_detected:
             self.current_path.obstacles_encountered += 1
+            # Track dynamic obstacle data
+            self._record_obstacle_observation(x, y, obstacle_confidence, obstacle_velocity)
+
+    def _record_obstacle_observation(self, x: float, y: float,
+                                     confidence: float, velocity: Tuple[float, float]):
+        """Record obstacle observation for dynamic tracking"""
+        cell = self._to_grid_cell(x, y)
+
+        if cell not in self.dynamic_obstacle_data:
+            self.dynamic_obstacle_data[cell] = []
+
+        self.dynamic_obstacle_data[cell].append({
+            'timestamp': time.time(),
+            'confidence': confidence,
+            'velocity': velocity,
+            'is_dynamic': abs(velocity[0]) > 0.01 or abs(velocity[1]) > 0.01
+        })
 
     def stop_recording(self, success: bool = True) -> Optional[RecordedPath]:
         """Stop recording and save the path"""
@@ -272,31 +299,147 @@ class PathMemory:
 
         return matching
 
-    def get_obstacle_hotspots(self, min_encounters: int = 3) -> List[Tuple[float, float, int]]:
+    def get_obstacle_hotspots(self, min_encounters: int = 3,
+                              use_temporal_decay: bool = True) -> List[Tuple[float, float, float]]:
         """
         Get locations where obstacles are frequently encountered
-        Returns: List of (x, y, count)
+        With temporal decay, recent observations are weighted higher
+        Returns: List of (x, y, weighted_count)
         """
-        obstacle_counts: Dict[Tuple[int, int], int] = {}
+        current_time = time.time()
+        obstacle_scores: Dict[Tuple[int, int], float] = {}
 
         for path in self.paths.values():
             for point in path.points:
                 if point.obstacle_detected:
                     cell = self._to_grid_cell(point.x, point.y)
-                    obstacle_counts[cell] = obstacle_counts.get(cell, 0) + 1
 
-        # Filter by minimum encounters and convert back to world coords
+                    if use_temporal_decay:
+                        # Apply temporal decay based on observation age
+                        age = current_time - point.timestamp
+                        decay = math.exp(-age * math.log(2) / self.obstacle_half_life)
+                        weight = point.obstacle_confidence * decay
+                    else:
+                        weight = 1.0
+
+                    obstacle_scores[cell] = obstacle_scores.get(cell, 0) + weight
+
+        # Filter by minimum score and convert back to world coords
         hotspots = []
-        for cell, count in obstacle_counts.items():
-            if count >= min_encounters:
+        for cell, score in obstacle_scores.items():
+            if score >= min_encounters:
                 x = (cell[0] + 0.5) * self.grid_resolution
                 y = (cell[1] + 0.5) * self.grid_resolution
-                hotspots.append((x, y, count))
+                hotspots.append((x, y, score))
 
-        # Sort by count
+        # Sort by score
         hotspots.sort(key=lambda h: h[2], reverse=True)
 
         return hotspots
+
+    def get_dynamic_obstacle_zones(self) -> List[Tuple[float, float, float, Tuple[float, float]]]:
+        """
+        Get zones where dynamic (moving) obstacles have been detected
+        Returns: List of (x, y, confidence, avg_velocity)
+        """
+        current_time = time.time()
+        dynamic_zones = []
+
+        for cell, observations in self.dynamic_obstacle_data.items():
+            # Filter to dynamic observations only
+            dynamic_obs = [o for o in observations if o.get('is_dynamic', False)]
+
+            if not dynamic_obs:
+                continue
+
+            # Calculate time-weighted confidence and average velocity
+            total_weight = 0
+            weighted_vx = 0
+            weighted_vy = 0
+
+            for obs in dynamic_obs:
+                age = current_time - obs['timestamp']
+                weight = obs['confidence'] * math.exp(-age * math.log(2) / self.obstacle_half_life)
+
+                total_weight += weight
+                weighted_vx += obs['velocity'][0] * weight
+                weighted_vy += obs['velocity'][1] * weight
+
+            if total_weight > 0.1:  # Minimum confidence threshold
+                x = (cell[0] + 0.5) * self.grid_resolution
+                y = (cell[1] + 0.5) * self.grid_resolution
+                avg_velocity = (weighted_vx / total_weight, weighted_vy / total_weight)
+
+                dynamic_zones.append((x, y, total_weight, avg_velocity))
+
+        return dynamic_zones
+
+    def decay_old_observations(self, max_age_seconds: float = None):
+        """
+        Remove obstacle observations older than max_age
+        This helps keep memory usage bounded
+        """
+        if max_age_seconds is None:
+            max_age_seconds = self.obstacle_half_life * 10  # Keep 10 half-lives
+
+        current_time = time.time()
+        cutoff = current_time - max_age_seconds
+
+        for cell in list(self.dynamic_obstacle_data.keys()):
+            # Filter out old observations
+            self.dynamic_obstacle_data[cell] = [
+                obs for obs in self.dynamic_obstacle_data[cell]
+                if obs['timestamp'] > cutoff
+            ]
+
+            # Remove empty cells
+            if not self.dynamic_obstacle_data[cell]:
+                del self.dynamic_obstacle_data[cell]
+
+    def get_time_weighted_avoidance_zones(self) -> List[Tuple[float, float, float, float]]:
+        """
+        Get avoidance zones with time-weighted confidence scores
+        Returns: List of (x, y, radius, confidence)
+        """
+        zones = []
+        current_time = time.time()
+
+        # Add time-weighted hotspots
+        hotspots = self.get_obstacle_hotspots(min_encounters=1, use_temporal_decay=True)
+        for x, y, score in hotspots:
+            if score > 0.5:  # Minimum confidence threshold
+                radius = min(0.5, 0.1 + score * 0.05)
+                zones.append((x, y, radius, min(score, 1.0)))
+
+        # Add failure points with decay
+        for path in self.paths.values():
+            if not path.success and path.points:
+                last = path.points[-1]
+                age = current_time - last.timestamp
+                decay = math.exp(-age * math.log(2) / self.obstacle_half_life)
+                if decay > 0.1:  # Only include if still relevant
+                    zones.append((last.x, last.y, 0.3, decay))
+
+        return zones
+
+    def update_obstacle_from_tracker(self, obstacle_id: str, x: float, y: float,
+                                     velocity: Tuple[float, float], confidence: float):
+        """
+        Update obstacle data from dynamic obstacle tracker
+        Called in real-time as obstacles are tracked
+        """
+        cell = self._to_grid_cell(x, y)
+
+        if cell not in self.dynamic_obstacle_data:
+            self.dynamic_obstacle_data[cell] = []
+
+        self.dynamic_obstacle_data[cell].append({
+            'timestamp': time.time(),
+            'confidence': confidence,
+            'velocity': velocity,
+            'is_dynamic': abs(velocity[0]) > 0.01 or abs(velocity[1]) > 0.01,
+            'obstacle_id': obstacle_id
+        })
 
     def get_preferred_route(self, start: Tuple[float, float],
                             goal: Tuple[float, float]) -> Optional[List[Tuple[float, float]]]:

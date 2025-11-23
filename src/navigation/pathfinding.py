@@ -24,7 +24,7 @@ class Node:
 
 
 class GridMap:
-    """2D occupancy grid for pathfinding"""
+    """2D occupancy grid for pathfinding with dynamic obstacle support"""
 
     def __init__(self, width: int, height: int, resolution: float = 0.1):
         """
@@ -37,8 +37,14 @@ class GridMap:
         self.height = height
         self.resolution = resolution
 
-        # 0 = free, 1 = occupied
+        # 0 = free, 1 = occupied (static obstacles)
         self.grid = np.zeros((height, width), dtype=np.uint8)
+
+        # Dynamic obstacle cost layer (0.0 to 1.0 confidence)
+        self.dynamic_cost = np.zeros((height, width), dtype=np.float32)
+
+        # Obstacle timestamps for decay
+        self.obstacle_timestamps = np.zeros((height, width), dtype=np.float64)
 
         # Robot configuration
         nav_config = config.navigation
@@ -49,6 +55,10 @@ class GridMap:
         self.inflation_radius = int(
             (self.robot_radius + self.safety_margin) / resolution
         )
+
+        # Dynamic obstacle settings
+        self.obstacle_decay_rate = nav_config.get('obstacle_decay_rate', 0.5)
+        self.min_confidence_threshold = 0.1
 
     def set_obstacle(self, x: int, y: int):
         """Mark a cell as obstacle"""
@@ -92,6 +102,96 @@ class GridMap:
     def clear(self):
         """Clear all obstacles"""
         self.grid.fill(0)
+        self.dynamic_cost.fill(0)
+        self.obstacle_timestamps.fill(0)
+
+    def add_dynamic_obstacle(self, x: float, y: float, radius: float = 0.1,
+                             confidence: float = 1.0):
+        """
+        Add a dynamic obstacle with confidence level
+        Args:
+            x, y: World coordinates
+            radius: Obstacle radius in meters
+            confidence: Detection confidence (0.0 to 1.0)
+        """
+        import time
+        center = self.world_to_grid(x, y)
+        radius_cells = int(radius / self.resolution) + self.inflation_radius
+        current_time = time.time()
+
+        for dy in range(-radius_cells, radius_cells + 1):
+            for dx in range(-radius_cells, radius_cells + 1):
+                if dx*dx + dy*dy <= radius_cells*radius_cells:
+                    ox, oy = center[0] + dx, center[1] + dy
+                    if 0 <= ox < self.width and 0 <= oy < self.height:
+                        # Update dynamic cost with max confidence
+                        self.dynamic_cost[oy, ox] = max(
+                            self.dynamic_cost[oy, ox],
+                            confidence
+                        )
+                        self.obstacle_timestamps[oy, ox] = current_time
+
+    def update_dynamic_obstacles(self, obstacles: List[Tuple[float, float, float, float]]):
+        """
+        Update grid with multiple dynamic obstacles
+        Args:
+            obstacles: List of (x, y, radius, confidence)
+        """
+        for x, y, radius, confidence in obstacles:
+            self.add_dynamic_obstacle(x, y, radius, confidence)
+
+    def apply_temporal_decay(self):
+        """Apply temporal decay to dynamic obstacle costs"""
+        import time
+        current_time = time.time()
+
+        # Calculate decay for each cell
+        time_diff = current_time - self.obstacle_timestamps
+        decay = np.exp(-self.obstacle_decay_rate * time_diff)
+
+        # Apply decay where timestamps exist
+        mask = self.obstacle_timestamps > 0
+        self.dynamic_cost[mask] *= decay[mask]
+
+        # Clear very low confidence areas
+        self.dynamic_cost[self.dynamic_cost < self.min_confidence_threshold] = 0
+
+    def get_combined_cost(self, x: int, y: int) -> float:
+        """
+        Get combined cost of static and dynamic obstacles
+        Returns: 0.0 (free) to inf (blocked)
+        """
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return float('inf')
+
+        # Static obstacle is impassable
+        if self.grid[y, x] == 1:
+            return float('inf')
+
+        # Dynamic obstacle adds cost based on confidence
+        dynamic = self.dynamic_cost[y, x]
+        if dynamic > 0.8:  # High confidence = treat as blocked
+            return float('inf')
+
+        # Return cost multiplier (1.0 = free, higher = avoid)
+        return 1.0 + dynamic * 10.0  # Scale dynamic cost
+
+    def clear_dynamic_obstacles(self):
+        """Clear only dynamic obstacles, keep static"""
+        self.dynamic_cost.fill(0)
+        self.obstacle_timestamps.fill(0)
+
+    def get_dynamic_obstacle_cells(self) -> List[Tuple[int, int, float]]:
+        """
+        Get all cells with dynamic obstacles
+        Returns: List of (x, y, confidence)
+        """
+        cells = []
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.dynamic_cost[y, x] > self.min_confidence_threshold:
+                    cells.append((x, y, self.dynamic_cost[y, x]))
+        return cells
 
     def get_inflated_grid(self) -> np.ndarray:
         """Get grid with obstacles inflated by robot radius"""
@@ -107,7 +207,7 @@ class GridMap:
 
 
 class AStarPathfinder:
-    """A* pathfinding algorithm"""
+    """A* pathfinding algorithm with dynamic obstacle support"""
 
     def __init__(self, grid_map: Optional[GridMap] = None):
         nav_config = config.navigation.get('pathfinding', {})
@@ -134,6 +234,12 @@ class AStarPathfinder:
         else:
             self.directions = [(0, 1), (1, 0), (0, -1), (-1, 0)]
             self.costs = [1.0, 1.0, 1.0, 1.0]
+
+        # Dynamic replanning settings
+        self.use_dynamic_costs = nav_config.get('use_dynamic_costs', True)
+        self.replan_threshold = nav_config.get('replan_threshold', 0.3)
+        self._last_path = None
+        self._last_goal = None
 
     def heuristic(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
         """Calculate heuristic (Euclidean distance)"""
@@ -212,8 +318,15 @@ class AStarPathfinder:
                 if neighbor in closed_set:
                     continue
 
-                # Calculate g score
-                tentative_g = current.g_score + self.costs[i]
+                # Calculate g score with dynamic cost
+                base_cost = self.costs[i]
+                if self.use_dynamic_costs:
+                    dynamic_multiplier = self.grid_map.get_combined_cost(neighbor[0], neighbor[1])
+                    if dynamic_multiplier == float('inf'):
+                        continue  # Skip blocked cells
+                    base_cost *= dynamic_multiplier
+
+                tentative_g = current.g_score + base_cost
 
                 if neighbor not in g_scores or tentative_g < g_scores[neighbor]:
                     g_scores[neighbor] = tentative_g
@@ -317,10 +430,113 @@ class AStarPathfinder:
 
     def update_obstacles(self, obstacles: List[Tuple[float, float, float]]):
         """
-        Update grid with new obstacles
+        Update grid with new static obstacles
         Args:
             obstacles: List of (x, y, radius) in world coordinates
         """
         self.grid_map.clear()
         for x, y, radius in obstacles:
             self.grid_map.add_obstacle_world(x, y, radius)
+
+    def update_dynamic_obstacles(self, obstacles: List[Tuple[float, float, float, float]]):
+        """
+        Update grid with dynamic obstacles (with confidence)
+        Args:
+            obstacles: List of (x, y, radius, confidence) in world coordinates
+        """
+        # Apply decay to existing dynamic obstacles
+        self.grid_map.apply_temporal_decay()
+
+        # Add new dynamic obstacles
+        self.grid_map.update_dynamic_obstacles(obstacles)
+
+    def needs_replan(self, current_position: Tuple[float, float],
+                    current_path: List[Tuple[float, float]]) -> bool:
+        """
+        Check if replanning is needed due to dynamic obstacles
+        Returns True if path is blocked or significantly impacted
+        """
+        if not current_path:
+            return True
+
+        # Check if any waypoint on current path is now blocked
+        for waypoint in current_path:
+            grid_pos = self.grid_map.world_to_grid(*waypoint)
+            cost = self.grid_map.get_combined_cost(grid_pos[0], grid_pos[1])
+
+            if cost == float('inf'):
+                logger.info("Replan needed: waypoint blocked by dynamic obstacle")
+                return True
+
+            if cost > 1.0 + self.replan_threshold * 10:
+                logger.info("Replan needed: path cost increased significantly")
+                return True
+
+        return False
+
+    def find_path_dynamic(self, start: Tuple[float, float],
+                          goal: Tuple[float, float],
+                          predicted_obstacles: List[Tuple[float, float, float, float]] = None
+                          ) -> Optional[List[Tuple[float, float]]]:
+        """
+        Find path considering dynamic/predicted obstacles
+        Args:
+            start: Start position (world coordinates)
+            goal: Goal position (world coordinates)
+            predicted_obstacles: List of (x, y, radius, confidence) for predicted positions
+        Returns:
+            Path in world coordinates or None
+        """
+        # Apply temporal decay
+        self.grid_map.apply_temporal_decay()
+
+        # Add predicted obstacles if provided
+        if predicted_obstacles:
+            self.grid_map.update_dynamic_obstacles(predicted_obstacles)
+
+        # Find path with dynamic costs
+        path = self.find_path_world(start, goal)
+
+        # Store for replan checking
+        self._last_path = path
+        self._last_goal = goal
+
+        return path
+
+    def get_path_risk_score(self, path: List[Tuple[float, float]]) -> float:
+        """
+        Calculate risk score for a path based on dynamic obstacles
+        Higher score = more risky
+        """
+        if not path:
+            return float('inf')
+
+        total_risk = 0.0
+        for waypoint in path:
+            grid_pos = self.grid_map.world_to_grid(*waypoint)
+            cost = self.grid_map.get_combined_cost(grid_pos[0], grid_pos[1])
+
+            if cost == float('inf'):
+                return float('inf')
+
+            total_risk += cost - 1.0  # Subtract base cost
+
+        return total_risk / len(path)  # Average risk per waypoint
+
+    def clear_and_update(self, static_obstacles: List[Tuple[float, float, float]],
+                        dynamic_obstacles: List[Tuple[float, float, float, float]]):
+        """
+        Clear grid and update with both static and dynamic obstacles
+        Args:
+            static_obstacles: List of (x, y, radius)
+            dynamic_obstacles: List of (x, y, radius, confidence)
+        """
+        # Clear static grid only
+        self.grid_map.grid.fill(0)
+
+        # Add static obstacles
+        for x, y, radius in static_obstacles:
+            self.grid_map.add_obstacle_world(x, y, radius)
+
+        # Update dynamic obstacles
+        self.grid_map.update_dynamic_obstacles(dynamic_obstacles)

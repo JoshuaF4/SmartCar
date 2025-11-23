@@ -245,15 +245,15 @@ class TestPathMemory:
             path_memory.record_point(x=1.0, y=1.0)
             path_memory.stop_recording()
 
-        # Use min_encounters=1 to catch any hotspots
-        hotspots = path_memory.get_obstacle_hotspots(min_encounters=1)
+        # Use min_encounters=0.1 to catch any hotspots (with temporal decay scores may be < 1)
+        hotspots = path_memory.get_obstacle_hotspots(min_encounters=0.1, use_temporal_decay=False)
 
         assert len(hotspots) > 0
         # Check hotspot is near (0.5, 0.5)
         hotspot = hotspots[0]
         assert abs(hotspot[0] - 0.5) < 0.2
         assert abs(hotspot[1] - 0.5) < 0.2
-        assert hotspot[2] >= 1  # count
+        assert hotspot[2] >= 1  # count (without decay should be 3)
 
     def test_get_preferred_route(self, path_memory):
         """Test getting preferred route from history"""

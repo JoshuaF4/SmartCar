@@ -13,6 +13,7 @@ from .hardware import MotorController, ServoController, SensorManager
 from .camera import CameraCapture, CameraArm
 from .detection import NeoYoloDetector
 from .navigation import AStarPathfinder, ObstacleAvoider, PathMemory
+from .navigation.dynamic_obstacles import DynamicObstacleTracker
 from .config import config
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class SmartCarController:
         self.pathfinder = AStarPathfinder()
         self.avoider = ObstacleAvoider(self.sensors)
         self.path_memory = PathMemory()
+        self.obstacle_tracker = DynamicObstacleTracker()
 
         # State
         self.mode = CarMode.IDLE
@@ -183,6 +185,9 @@ class SmartCarController:
         detection_result = self.detector.detect_obstacles(frame)
         self.last_detection_result = detection_result
 
+        # Update dynamic obstacle tracker
+        self._update_obstacle_tracking(detection_result)
+
         # Trigger callback
         if self.on_detection and detection_result['has_danger']:
             self.on_detection(detection_result)
@@ -204,6 +209,38 @@ class SmartCarController:
         # Update position estimate and record path
         self._update_position(command)
         self._record_path_point(detection_result)
+
+    def _update_obstacle_tracking(self, detection_result: Dict):
+        """Update dynamic obstacle tracker with new detections"""
+        detections = []
+
+        for obstacle in detection_result.get('obstacles', []):
+            # Convert detection to world coordinates
+            # This is simplified - real implementation would use camera calibration
+            x = self.current_position[0] + obstacle.get('distance', 0.5) * \
+                __import__('math').cos(__import__('math').radians(self.current_heading))
+            y = self.current_position[1] + obstacle.get('distance', 0.5) * \
+                __import__('math').sin(__import__('math').radians(self.current_heading))
+
+            size = obstacle.get('size', 0.1)
+            confidence = obstacle.get('confidence', 0.8)
+
+            detections.append((x, y, size, confidence))
+
+        if detections:
+            self.obstacle_tracker.update(detections)
+
+            # Update pathfinder with dynamic obstacles
+            current_obstacles = self.obstacle_tracker.get_current_obstacles()
+            self.pathfinder.update_dynamic_obstacles(current_obstacles)
+
+            # Update path memory with dynamic obstacle data
+            for obs in self.obstacle_tracker.obstacles.values():
+                if len(obs.observations) >= 2:
+                    self.path_memory.update_obstacle_from_tracker(
+                        obs.obstacle_id, obs.x, obs.y,
+                        (obs.vx, obs.vy), obs.confidence
+                    )
 
     def _update_position(self, command: Dict):
         """Update estimated position based on motor commands"""
@@ -240,13 +277,30 @@ class SmartCarController:
 
         self._position_update_interval = 0
 
+        # Get obstacle velocity if dynamic obstacles detected
+        obstacle_velocity = (0.0, 0.0)
+        obstacle_confidence = 1.0
+
+        dynamic_obstacles = self.obstacle_tracker.get_dynamic_obstacles()
+        if dynamic_obstacles:
+            # Use velocity of nearest dynamic obstacle
+            nearest = min(dynamic_obstacles, key=lambda o:
+                __import__('math').sqrt(
+                    (o.x - self.current_position[0])**2 +
+                    (o.y - self.current_position[1])**2
+                ))
+            obstacle_velocity = (nearest.vx, nearest.vy)
+            obstacle_confidence = nearest.confidence
+
         self.path_memory.record_point(
             x=self.current_position[0],
             y=self.current_position[1],
             heading=self.current_heading,
             speed=self.current_speed,
             obstacle_detected=detection_result.get('has_danger', False),
-            sensor_data=self.sensors.distances.copy()
+            sensor_data=self.sensors.distances.copy(),
+            obstacle_confidence=obstacle_confidence,
+            obstacle_velocity=obstacle_velocity
         )
 
     def _pathfinding_control(self):
@@ -254,6 +308,11 @@ class SmartCarController:
         if not self.current_path or len(self.current_path) == 0:
             self.motors.stop()
             return
+
+        # Check if replanning is needed due to dynamic obstacles
+        if self.pathfinder.needs_replan(self.current_position, self.current_path):
+            logger.info("Replanning path due to dynamic obstacles")
+            self._replan_path()
 
         # Get next waypoint
         target = self.current_path[0]
@@ -266,6 +325,28 @@ class SmartCarController:
         # In real implementation, use odometry/localization
         if len(self.current_path) > 1:
             self.current_path.pop(0)
+
+    def _replan_path(self):
+        """Replan path considering current dynamic obstacles"""
+        if not self.current_path:
+            return
+
+        goal = self.current_path[-1]
+
+        # Get predicted obstacle positions
+        prediction_time = time.time() + 2.0  # Look 2 seconds ahead
+        predicted_obstacles = self.obstacle_tracker.get_predicted_obstacles(prediction_time)
+
+        # Find new path with predicted obstacles
+        new_path = self.pathfinder.find_path_dynamic(
+            self.current_position, goal, predicted_obstacles
+        )
+
+        if new_path:
+            self.current_path = list(new_path)
+            logger.info(f"Replanned path with {len(new_path)} waypoints")
+        else:
+            logger.warning("Could not find alternative path")
 
     def _assisted_control(self):
         """Computer-assisted control mode"""
@@ -304,7 +385,10 @@ class SmartCarController:
             'camera_position': self.servos.get_position(),
             'detection_fps': self.detector.get_fps(),
             'path_memory_stats': self.path_memory.get_statistics(),
-            'is_recording_path': self.path_memory.is_recording
+            'is_recording_path': self.path_memory.is_recording,
+            'dynamic_obstacles_count': len(self.obstacle_tracker.get_dynamic_obstacles()),
+            'static_obstacles_count': len(self.obstacle_tracker.get_static_obstacles()),
+            'collision_risks': len(self.get_collision_risks())
         }
 
     # Manual control methods
@@ -396,6 +480,40 @@ class SmartCarController:
                             goal: Tuple[float, float]):
         """Get successful historical paths between points"""
         return self.path_memory.get_successful_paths(start, goal)
+
+    # Dynamic obstacle methods
+    def get_dynamic_obstacles(self):
+        """Get currently tracked dynamic obstacles"""
+        return self.obstacle_tracker.get_dynamic_obstacles()
+
+    def get_collision_risks(self, time_horizon: float = 2.0):
+        """Get collision risks with dynamic obstacles"""
+        velocity = (
+            self.current_speed / 100.0 * __import__('math').cos(__import__('math').radians(self.current_heading)),
+            self.current_speed / 100.0 * __import__('math').sin(__import__('math').radians(self.current_heading))
+        )
+        return self.obstacle_tracker.get_collision_risk(
+            self.current_position, velocity, time_horizon
+        )
+
+    def get_obstacle_tracker_state(self):
+        """Export dynamic obstacle tracker state"""
+        return self.obstacle_tracker.export_state()
+
+    def get_predicted_obstacles(self, seconds_ahead: float = 2.0):
+        """Get predicted obstacle positions"""
+        import time
+        future_time = time.time() + seconds_ahead
+        return self.obstacle_tracker.get_predicted_obstacles(future_time)
+
+    def get_dynamic_obstacle_zones(self):
+        """Get zones with dynamic obstacle history"""
+        return self.path_memory.get_dynamic_obstacle_zones()
+
+    def decay_obstacle_memory(self):
+        """Apply decay to old obstacle observations"""
+        self.path_memory.decay_old_observations()
+        self.pathfinder.grid_map.apply_temporal_decay()
 
     def reset_position(self, x: float = 0.0, y: float = 0.0, heading: float = 0.0):
         """Reset position tracking"""
